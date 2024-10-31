@@ -219,6 +219,11 @@ def which_attn_to_use(
         else:
             logger.info("%s is not supported in AMD GPUs.", selected_backend)
         return _Backend.ROCM_FLASH
+    
+    if current_platform.is_cuda():
+        selected_backend = (_Backend.ROCM_FLASH if selected_backend
+                            == _Backend.FLASH_ATTN else selected_backend)
+        return _Backend.ROCM_FLASH
 
     if envs.VLLM_USE_V1:
         return _Backend.FLASH_ATTN_VLLM_V1
