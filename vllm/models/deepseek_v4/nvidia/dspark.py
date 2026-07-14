@@ -30,7 +30,10 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.logits_processor import (
+    LogitsProcessor,
+    top_tokens_from_local_logits,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -118,6 +121,7 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            replicate_w1=vllm_config.speculative_config.replicate_markov_w1,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -336,6 +340,35 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    # --- Local-argmax drafting (use_local_argmax_reduction) -----------------
+    # Shard-local variants used by DSparkSpeculator's greedy draft loop: base
+    # logits and the Markov bias stay vocab-sharded, and only (value, index)
+    # pairs cross TP per draft step instead of full-vocab gathers. lm_head and
+    # markov_w2 share the same full-vocab sharding (full-vocab draft), so
+    # their shard-local logits are addition-compatible.
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy next tokens via vocab-parallel pair reduction."""
+        return self.logits_processor.get_top_tokens(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def compute_local_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Shard-local base logits U_k (no TP gather; vocab padding kept)."""
+        return self.logits_processor.compute_local_logits(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def local_markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """Shard-local Markov bias, addition-compatible with the base shard."""
+        return self.logits_processor.compute_local_logits(
+            self.model.markov_head.markov_w2, markov_embed
+        )
+
+    def local_draft_top_tokens(self, local_logits: torch.Tensor) -> torch.Tensor:
+        """Global greedy ids from shard-local (base + bias) logits."""
+        return top_tokens_from_local_logits(local_logits, self.lm_head)
 
     # --- Weight loading ----------------------------------------------------
 

@@ -98,14 +98,51 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return model
 
+    def _validate_local_argmax_reduction(self) -> None:
+        super()._validate_local_argmax_reduction()
+        if not self.use_local_argmax_reduction:
+            return
+        # DSpark's sequential loop needs the shard-local protocol on top of
+        # get_top_tokens: base logits and the per-step Markov bias must stay
+        # vocab-sharded so only (value, index) pairs cross TP.
+        required = (
+            "compute_local_draft_logits",
+            "local_markov_bias",
+            "local_draft_top_tokens",
+        )
+        missing = [m for m in required if not hasattr(self.model, m)]
+        if missing:
+            raise ValueError(
+                "use_local_argmax_reduction with DSpark requires the draft "
+                f"model to implement {list(required)}; "
+                f"{self.model.__class__.__name__} is missing {missing}."
+            )
+        if getattr(self.model, "draft_id_to_target_id", None) is not None:
+            raise ValueError(
+                "use_local_argmax_reduction with DSpark requires a full-vocab "
+                "draft: a reduced draft vocab (draft_id_to_target_id set) is "
+                "not shard-aligned with the target lm_head."
+            )
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        # Greedy local-argmax path: keep base logits vocab-sharded; only
+        # (value, index) pairs cross TP per step. Validated at startup by
+        # _validate_local_argmax_reduction (incompatible with probabilistic
+        # drafting, which feeds full logits to the rejection sampler, so
+        # draft_logits is None whenever the flag is set).
+        use_local_argmax = (
+            self.use_local_argmax_reduction and self.draft_logits is None
+        )
+        if use_local_argmax:
+            base_logits = self.model.compute_local_draft_logits(sample_hidden)
+        else:
+            # Draft-vocab logits; sampled ids are remapped to target vocab below.
+            base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
@@ -119,6 +156,17 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
+            if use_local_argmax:
+                # Shard-local bias + pair-reduce argmax; no full-vocab gather.
+                logits_i = base_logits[:, i] + self.model.local_markov_bias(
+                    markov_embed
+                )
+                draft_sampled_i = self.model.map_draft_to_target(
+                    self.model.local_draft_top_tokens(logits_i)
+                )
+                self.draft_tokens[:num_reqs, i] = draft_sampled_i
+                prev = draft_sampled_i
+                continue
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             if self.draft_logits is not None:

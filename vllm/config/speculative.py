@@ -141,6 +141,14 @@ class SpeculativeConfig:
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
+    replicate_markov_w1: bool = False
+    """Replicate the DSpark Markov head's token-embedding matrix (markov_w1)
+    on every TP rank instead of vocab-sharding it, turning the per-draft-step
+    Markov embedding lookup into a local read with no TP all-reduce. Costs
+    vocab_size * markov_rank extra parameters per rank (~66 MB for a 129K
+    vocab at rank 256 in bf16); worthwhile when TP spans nodes (e.g. two DGX
+    Sparks over RoCE, where every collective crosses the network). Only
+    applies to the DSpark method."""
 
     use_heterogeneous_vocab: bool = False
     """Allow draft and target models to use different vocabularies.

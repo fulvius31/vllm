@@ -48,12 +48,21 @@ class DSparkMarkovHead(nn.Module):
         draft_vocab_size: int,
         markov_rank: int,
         prefix: str,
+        replicate_w1: bool = False,
     ) -> None:
         super().__init__()
-        # TODO(ben): profile for which (if any) it makes sense to replicate or TP-shard
-        self.markov_w1 = VocabParallelEmbedding(
-            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
-        )
+        self.markov_w1: nn.Module
+        if replicate_w1:
+            # Full [V, r] copy on every rank: embed() becomes a local lookup
+            # with no TP all-reduce, which matters when TP spans nodes (see
+            # SpeculativeConfig.replicate_markov_w1). Loaded whole via
+            # default_weight_loader (no weight_loader attribute).
+            self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+            self.markov_w1.weight.requires_grad_(False)
+        else:
+            self.markov_w1 = VocabParallelEmbedding(
+                vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
+            )
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
         )
@@ -84,11 +93,15 @@ class Qwen3DSparkModel(DFlashQwen3Model):
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
+        spec_config = vllm_config.speculative_config
         self.markov_head = DSparkMarkovHead(
             config.vocab_size,
             draft_vocab_size,
             config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            replicate_w1=(
+                spec_config is not None and spec_config.replicate_markov_w1
+            ),
         )
 
 
