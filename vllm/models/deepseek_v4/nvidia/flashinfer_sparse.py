@@ -17,6 +17,10 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
 )
+from vllm.models.deepseek_v4.nvidia.sparse_mla_sm120_decode import (
+    sm120_wrapper_decode,
+    use_sm120_wrapper_decode,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
@@ -766,6 +770,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        if use_sm120_wrapper_decode():
+            # Multi-query-capable path (needed for MTP speculative verify,
+            # 1 < q_len <= 64, which the raw call below rejects with
+            # ``num_tokens > 64``). See sparse_mla_sm120_decode.py.
+            sm120_wrapper_decode(
+                self,
+                q=q,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                indexed_kv_cache=kv_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                extra_sparse_indices=extra_sparse_indices,
+                extra_sparse_lengths=extra_sparse_lengths,
+                output=output,
+            )
+            return
         flashinfer_trtllm_batch_decode_sparse_mla_dsv4(
             query=q,
             swa_kv_cache=swa_cache,

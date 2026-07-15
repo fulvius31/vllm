@@ -1092,6 +1092,38 @@ class VllmConfig:
             "enabled" if self.scheduler_config.async_scheduling else "disabled",
         )
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and self.parallel_config.world_size > 1
+            and self.model_config is not None
+            and not self.model_config.enforce_eager
+            and os.getenv("VLLM_DSPARK_ALLOW_MULTIRANK_CUDAGRAPH", "0")
+            in ("0", "", "false")
+        ):
+            # DSpark speculative decoding + CUDA graphs deadlocks NCCL on
+            # multi-rank TP (validated on 2x GB10 over RoCE): both ranks issue
+            # byte-identical collective call sequences, but torch/NCCL batches
+            # them into group launches differently per rank under graph capture
+            # (observed as a one-group opCount skew), so the aggregated NCCL
+            # kernels pair up shifted across ranks. The draft loop's periodic
+            # collective pattern lets the shifted pairing limp along for dozens
+            # of steps until a size boundary blocks and one rank spins forever
+            # in ncclDevKernel_AllGather while the peer drains empty. This is
+            # below vLLM (same class as the deepseek_v32 MTP FIXME in
+            # SpeculativeConfig, whose draft-only enforce_eager is insufficient
+            # here -- an eager draft with captured target graphs still
+            # deadlocks). Force whole-engine eager until the torch/NCCL
+            # group-launch divergence is fixed; escape hatch:
+            # VLLM_DSPARK_ALLOW_MULTIRANK_CUDAGRAPH=1.
+            logger.warning_once(
+                "DSpark speculative decoding with CUDA graphs is not supported "
+                "on multi-rank TP (NCCL group-launch divergence deadlock); "
+                "forcing enforce_eager. Set "
+                "VLLM_DSPARK_ALLOW_MULTIRANK_CUDAGRAPH=1 to override."
+            )
+            self.model_config.enforce_eager = True
+
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
                 if self.parallel_config.data_parallel_size > 1 and (
