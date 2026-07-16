@@ -87,6 +87,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
+            import os
+
+            if os.getenv("VLLM_DISABLE_PYNCCL", "0").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+                "",
+            ):
+                # Route all_reduce/all_gather through torch's ProcessGroupNCCL
+                # (dedicated comm stream + watchdog + flight recorder) instead
+                # of the in-thread, current-stream pynccl wrapper. Diagnostic /
+                # mitigation knob for cross-rank collective-pairing wedges
+                # observed on multi-node TP (GB10 2-node over RoCE): pynccl
+                # enqueue calls were seen blocking in-call while the peer's
+                # collective spun unpaired. Only all_reduce/all_gather consult
+                # this flag; reduce_scatter/PP paths still use pynccl.
+                self.pynccl_comm.disabled = True
+                logger.info_once(
+                    "VLLM_DISABLE_PYNCCL=1: TP all_reduce/all_gather fall back "
+                    "to torch.distributed (ProcessGroupNCCL)."
+                )
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
