@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+_FLASHINFER_DSV4_DECODE_TOPKS = (128, 512, 1024)
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
@@ -539,23 +540,66 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def _as_sparse_cache(kv_cache: torch.Tensor) -> torch.Tensor:
         if kv_cache.dtype == torch.float8_e4m3fn:
             kv_cache = kv_cache.view(torch.uint8)
-        if kv_cache.dim() == 4:
-            return kv_cache
-        return kv_cache.unsqueeze(-2)
+        if kv_cache.dim() != 4:
+            kv_cache = kv_cache.unsqueeze(-2)
+
+        # vLLM may expose an oversized 256-token allocation page for the SWA
+        # segment while FlashInfer's native SM120/SM121 DSv4 decode kernel uses
+        # 64-token SWA pages. Packed slots are physically contiguous and indices
+        # are flattened slot IDs, so split only oversized pages into zero-copy
+        # 64-token views. Compressed C128A pages are intentionally only 2 tokens
+        # (and are supported by FlashInfer's dual-cache path), so leave them as-is.
+        if (
+            kv_cache.dtype == torch.uint8
+            and kv_cache.shape[-1] == 584
+            and kv_cache.shape[-3] > 64
+        ):
+            page_size = kv_cache.shape[-3]
+            if page_size % 64 != 0:
+                raise ValueError(
+                    "Packed SM120 DSv4 KV page size must be a multiple of 64, "
+                    f"got {page_size}."
+                )
+            expected_strides = (page_size * 584, 584, 584, 1)
+            if kv_cache.stride() != expected_strides:
+                raise ValueError(
+                    "Packed SM120 DSv4 KV cache cannot be split into zero-copy "
+                    f"64-token pages: shape={tuple(kv_cache.shape)}, "
+                    f"strides={kv_cache.stride()}, expected={expected_strides}."
+                )
+            kv_cache = kv_cache.view(-1, 64, 1, 584)
+        return kv_cache
+
+    @staticmethod
+    def _pad_decode_sparse_indices(indices: torch.Tensor) -> torch.Tensor:
+        """Pad DSpark's non-causal top-k to a native SM120 kernel width."""
+        topk = indices.shape[-1]
+        if topk in _FLASHINFER_DSV4_DECODE_TOPKS:
+            return indices
+        for supported_topk in _FLASHINFER_DSV4_DECODE_TOPKS:
+            if topk < supported_topk:
+                # -1 is FlashInfer's documented invalid-slot sentinel. The
+                # per-token top-k lengths remain unchanged, so padded entries
+                # cannot contribute to attention.
+                return torch.nn.functional.pad(
+                    indices, (0, supported_topk - topk), value=-1
+                )
+        raise ValueError(
+            "SM120 DSv4 sparse decode supports at most 1024 SWA indices, "
+            f"got {topk}."
+        )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
-        if num_heads <= 16:
-            return 16
-        if num_heads <= 32:
-            return 32
-        if num_heads <= 64:
-            return 64
-        if num_heads <= 128:
-            return 128
+        # FlashInfer's native SM120/SM121 DSv4 sparse backend supports these
+        # widths directly. TP2 uses 32 heads per rank, so avoid needless 64-head
+        # padding while retaining the general next-supported-width behavior.
+        for supported_heads in (8, 16, 32, 64, 128):
+            if num_heads <= supported_heads:
+                return supported_heads
         raise ValueError(
             f"DeepseekV4 FlashInfer MLA Sparse does not support {num_heads} heads "
-            "(SM120 kernel requires h_q in {16, 32, 64, 128})."
+            "(SM120/SM121 kernel supports h_q in {8, 16, 32, 64, 128})."
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -759,6 +803,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None
         assert swa_lens is not None
+        swa_indices = self._pad_decode_sparse_indices(swa_indices)
         q = self._prepare_query(q, output)
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
